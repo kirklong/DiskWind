@@ -1,10 +1,12 @@
 #!/usr/bin/env julia
-using FITSIO, Plots, Printf, NumericalIntegration, StatsBase, DelimitedFiles, DSP, Interpolations, CubicSplines
+using FITSIO, Plots, Printf, NumericalIntegration, StatsBase, DelimitedFiles, DSP, Interpolations, CubicSplines, Distributions
 #include("pyimports.jl")
 using .pyimports: numpy
 #sorting all visit files
 #files = readdir("/home/kirk/Documents/research/Dexter/STORM/HST/models/")
 
+
+################################# DATA STRUCTURES AND READING FUNCTIONS ################################
 function getSortedFiles(spectra_dir=pwd())
     files = readdir(spectra_dir)
     function file_sort_key(file_name)
@@ -22,12 +24,6 @@ function getSortedFiles(spectra_dir=pwd())
     return sorted_files
 end
 
-function getFillShape(x, y)
-    shapex = vcat(x[1], x[1], x[end], x[end])
-    shapey = vcat(y[1], y[end], y[end], y[1])
-    return shapex, shapey
-end
-
 function getSpectrumTimeInfo(file)
     f = FITS(file)
     header_string = read_header(f[1],String)
@@ -41,8 +37,8 @@ struct spectrum
     λ::Array{Float64,1}
     flux::Array{Float64,1}
     error::Array{Float64,1}
-    cont_flux::Array{Float64,1}
-    model_flux::Array{Float64,1}
+    cont_flux::Union{Array{Float64,1},Nothing}
+    model_flux::Union{Array{Float64,1},Nothing}
     t::Float64
     exp::Float64
 end
@@ -98,18 +94,87 @@ function getLC(LCData,name,tStop=75.)
     return LC(t[mask],f[mask],e[mask])
 end
 
-#do polynomial interpolation of LC data to fill in between timestamps, specify N points between each tBinned
-function getSpline(x::Array{Float64,1},y::Array{Float64,1})
-    if length(x) != length(y)
-        error("x and y must be same length")
-        return nothing
+function getSpectra(sortedFiles; src_dir=pwd(),model="all")
+    data = Array{spectrum,1}(undef, length(sortedFiles))
+    for (i,file) in enumerate(sortedFiles)
+        filename = string(src_dir,file)
+        f = FITS(filename)
+        λ = model != false ? read(f[2], "WAVE") : read(f[2], "WAVELENGTH") #angstroms
+        flux = read(f[2], "FLUX") #cW / m^2 / A
+        error = model != false ? read(f[2], "e_FLUX") : read(f[2], "ERROR") #"          "
+        cont_flux = model != false ? read(f[2], "FCONT") : nothing  #"      "
+        model_flux = nothing
+        if model != false
+            if model == "all"
+                model_flux = read(f[2], "MODFLUX")
+            else
+                if typeof(model) == Array{Int64,1}
+                    model_flux = read(f[2],"GAUSS$(model[1])")
+                    for j in model[2:end]
+                        model_flux .+= read(f[2],"GAUSS$j")
+                    end
+                elseif typeof(model) == Int64 || typeof(model) == Int32
+                    model_flux = read(f[2],"GAUSS$model")
+                else
+                    error("model must be an integer or array of integers")
+                end
+            end
+        end
+        exp,t = getSpectrumTimeInfo(filename)
+        data[i] = spectrum(filename, λ, flux, error, cont_flux, model_flux, t, exp)
     end
-    spline = CubicSpline(x,y)
-    f(x) = spline[x]
-    return f
+    return data
 end
 
-function getHSTData(LCfile,spectra_dir,line="CIV",cont="1367",tStop=75.,wrap=true)
+struct avgSpectrum
+    λ::Array{Float64,1}
+    flux::Array{Float64,1}
+    error::Array{Float64,1}
+    model_flux::Array{Float64,1}
+end
+
+function getAvgSpectrum(spectra; λRange=nothing)
+    avg_λ = sort(unique(vcat([spectra[i].λ for i in 1:length(spectra)]...)))
+    if λRange != nothing
+        mask = (avg_λ .> λRange[1]) .& (avg_λ .< λRange[2])
+        avg_λ = avg_λ[mask]
+    end
+    avg_flux = zeros(length(avg_λ))
+    avg_error = zeros(length(avg_λ))
+    avg_model_flux = zeros(length(avg_λ))
+    n = zeros(length(avg_λ))
+    for (i,λ) in enumerate(avg_λ)
+        for spectrum in spectra
+            if λ in spectrum.λ
+                ind = findfirst(spectrum.λ .== λ)
+                avg_flux[i] += spectrum.flux[ind]
+                avg_error[i] += spectrum.error[ind]^2
+                avg_model_flux[i] += spectrum.model_flux[ind]
+                n[i] += 1
+            end
+        end
+    end
+    return avgSpectrum(avg_λ,avg_flux./n,sqrt.(avg_error)./n,avg_model_flux./n)
+end
+
+function getLineModelStrings(line::String; sample_fits::String="/home/kirk/Documents/research/Dexter/STORM/HST/models/hlsp_storm_hst_cos_ngc-5548-go13330-v0a_g130m-g160m_v1_model.fits") #don't think this is quite right at end product, do further testing tmoorrow
+    f = FITS(sample_fits)
+    header_string = read_header(f[1],String)
+    split_strip_header = strip.(split(header_string,"HISTORY"))
+    GaussianModelStrings = split_strip_header[startswith.(split_strip_header,"Gaussian")]
+    lineMask = occursin.(line,GaussianModelStrings)
+    lineStrings = GaussianModelStrings[lineMask]
+    BLRMask = occursin.("Broad",lineStrings)
+    BLAMask = occursin.("Broad Absorption",lineStrings)
+    BLREmissionMask = (BLRMask) .& (.!BLAMask)
+    bumpMask = occursin.("Bump",lineStrings)
+    finalMask = (BLREmissionMask) .|| (bumpMask)
+    lineStrings = lineStrings[finalMask]
+    components = [strip(split(lineStrings[i]," ")[3],':') for i in eachindex(lineStrings)]
+    return tryparse.(Int,components)
+end
+
+function getHSTData(LCfile,spectra_dir,line="CIV",cont="1367",tStop=75.;wrap=true)
     LCData = getLCData(LCfile)
     lineLC = getLC(LCData,line,tStop)
     CLC = getLC(LCData,cont,tStop)
@@ -132,6 +197,19 @@ function getHSTDataWrap(input)
     line_t,lineLC,LCerror,cont_t,contLC,λ,model_flux,LPerror = getHSTData(LCfile,spectra_dir,line,cont,tStop)
     return numpy[].array([line_t,lineLC,LCerror,cont_t,contLC,λ,model_flux,LPerror],dtype="object")
 end
+
+############################# ANALYSIS FUNCTIONS / PLOTTING #############################
+#do polynomial interpolation of LC data to fill in between timestamps, specify N points between each tBinned
+function getSpline(x::Array{Float64,1},y::Array{Float64,1})
+    if length(x) != length(y)
+        error("x and y must be same length")
+        return nothing
+    end
+    spline = CubicSpline(x,y)
+    f(x) = spline[x]
+    return f
+end
+
 
 function plotLC(LCData, lineList; tRange = nothing, spline = false, model = nothing)
     t = [LCData[i].t for i in 1:length(LCData)]
@@ -211,60 +289,164 @@ function syntheticLC(Ct,CLC,Ψτ;continuum="1367",tStop=75.,spline=false) #assum
 end
 
 #now generate cross correlation function from getSpectra
-function getCCF(LCData; continuum="F1367", emission="F_Lya", tRange = nothing, normalize=true, lags = nothing, spline = false, model = nothing)
-    #continuum and emission are the names of the fields in the datum struct
-    #spectra is an array of datum structs
+function getCCF(u,v,tu,tv; z = 0.0, tRange = nothing, normalize=true, lags = nothing, superSample = 100)
+    #u and v are LC to cross correlate (i.e. u = CLC and v = lineLC), t is shared time array
     #lags can either be an integer array of index shifts to try, a minimum and maximum time shift, or nothing (default)
     #returns an array of cross correlation values
-    
+    #note that this assumes u and v are sampled at the same times in t, see note below
+
     #TO-DO -- add interpolation in case spectra t and continuum t don't match up -- or is this already done? confused by paper vs. txt file
-    mask = Bool.(ones(Int,length(LCData)))
-    t = [LCData[i].t for i in 1:length(LCData)]
-    t = t.-t[1] #normalize to first visit
+    umask = Bool.(ones(Int,length(tu))); vmask = Bool.(ones(Int,length(tv)))
+    tu = tu.-tu[1]; tv = tv.-tv[1] #normalize to first visit
+    tu = tu./(1+z); tv = tv./(1+z) #rest frame of emitter, correct for redshift
+    tList = [tu,tv]
+    if length(tu) == length(tv)
+        if sum(tu.==tv) == length(tv)
+            tList = [tu]
+        end
+    end
+    if length(tu) != length(u) || length(tv) != length(v)
+        error("tu/tv and u/v must be same length")
+        return nothing
+    end
     if tRange != nothing
-        mask = (t.>tRange[1]) .& (t.<tRange[2])
-        t = t[mask]
+        umask = (tu.>tRange[1]) .& (tu.<tRange[2])
+        vmask = (tv.>tRange[1]) .& (tv.<tRange[2])
+        tu = tu[umask]; tv = tv[vmask]
     end
-    u = [getproperty(LCData[i],Symbol(continuum)) for i in 1:length(LCData)]
-    v = [getproperty(LCData[i],Symbol(emission)) for i in 1:length(LCData)]
-    if spline 
-        uSpline = getSpline(t,u[mask])
-        vSpline = getSpline(t,v[mask])
-        tSpline = range(t[1],t[end],length=1000)
-        u = uSpline.(tSpline); v = vSpline.(tSpline)
-    end
-    if normalize
-        u = u./maximum(u)
-        v = v./maximum(v)
-    end
-    if lags == nothing || (typeof(lags) != Array{Float64,1} && typeof(lags) != Array{Int64,1}) #default lags from docs
-        lags = collect(-minimum(Int,(size(u,1)-1, floor(10*log10(size(u,1))))):minimum(Int,(size(u,1), floor(10*log10(size(u,1))))))
-    elseif length(lags) == 2 #lagRange
-        minInd = -findfirst(t.>abs(lags[1]))
-        maxInd = findfirst(t.>lags[2])
-        lags = collect(minInd:maxInd)
-    end
-    CCF = crosscor(u,v,lags) #cross correlation function
-    if model != nothing
-        u = model[1]; v = model[2]
-        if length(t) != length(u)
-            maxInd = minimum([length(t),length(u)])
-            u = u[1:maxInd]; v = v[1:maxInd]; t = t[1:maxInd]
+    CCFList = Array{Array{Float64,1},1}(undef,length(tList)); lagsList = Array{Array{Float64,1},1}(undef,length(tList))
+    ui = copy(u); vi = copy(v)
+    for (i,t) in enumerate(tList)
+        tLags = range(t[1],t[end],length=superSample*length(t)) #super sample t to get more accurate interpolation
+        uInterp = LinearInterpolation(tu,u[umask],extrapolation_bc=Line())
+        vInterp = LinearInterpolation(tv,v[vmask],extrapolation_bc=Line())
+        ui = uInterp.(tLags); vi = vInterp.(tLags) #interpolate to super sampled t, so spacing in lags is fixed
+        if normalize
+            ui = ui./maximum(ui)
+            vi = vi./maximum(vi)
         end
-        if spline
-            uSpline = getSpline(t,u)
-            vSpline = getSpline(t,v)
-            u = uSpline.(t); v = vSpline.(t)
+        if lags == nothing || (typeof(lags) != Array{Float64,1} && typeof(lags) != Array{Int64,1}) #default lags from docs
+            lags = collect(-minimum(Int,(size(ui,1)-1, floor(10*log10(size(ui,1))))):minimum(Int,(size(ui,1), floor(10*log10(size(ui,1))))))
+        elseif length(lags) == 2 #lagRange
+            minInd = -findfirst(tLags.>abs(lags[1]))
+            maxInd = findfirst(tLags.>lags[2])
+            lags = collect(minInd:maxInd)
         end
-        model_ccf = crosscor(u,v,lags)
-        CCF = [CCF,model_ccf] #also return model CCF, assume model = [model_continuum_LC, model_emission_LC]
+        CCF = crosscor(ui,vi,lags) #cross correlation function
+        CCFList[i] = CCF
+        lagsList[i] = vcat(-reverse(tLags[1:abs(lags[1])+1]),tLags[2:lags[end]+1])
     end
     #lags[1] = 0 -> t[1]; lags[end] = max +shift -> t[lags[end]+1]; lags[1] = max -shift -> -t[lags[1]+1]
-    return CCF, vcat(-reverse(t[1:abs(lags[1])+1]),t[2:lags[end]+1]) #lags here are index offsets from 0
-end #trying to reproduce figure 4 in https://iopscience.iop.org/article/10.1088/0004-637X/806/1/128/pdf , still not working perfectly
+    return mean(CCFList),mean(lagsList) #lags here are index offsets from 0
+end #trying to reproduce figure 4 in https://iopscience.iop.org/article/10.1088/0004-637X/806/1/128/pdf , think it works now
 
-function plotCCF(LCData; continuum="F1367",emission="F_Lya",tRange=nothing,normalize=true,lags=nothing,spline=false,model=nothing)
-    CCF, t = getCCF(LCData,continuum=continuum,emission=emission,tRange=tRange,normalize=normalize,lags=lags,spline=spline,model=model)
+getCCFPeak(CCF,lags) = lags[findmax(CCF)[2]] #peak of CCF
+function getCCFCentroid(CCF,lags;rCut = 0.8)
+    rMax = maximum(CCF)
+    mask = CCF.>rCut*rMax
+    return  sum(CCF[mask].*lags[mask])/sum(CCF[mask]) #centroid of CCF with cutoff imposed
+end
+
+function MCLC(LC,err,t) #get Monte Carlo light curve following FR/FSS outlined in appendix here: https://iopscience.iop.org/article/10.1086/423269/pdf
+    N = length(LC)
+    d = DiscreteUniform(1,N)
+    inds = rand(d,N)
+    uniqueCounts = countmap(inds)
+    uniqueInds = unique(inds)
+    MCLC = zeros(length(uniqueInds))
+    tMC = t[uniqueInds]
+    for (MCLCi,LCi) in enumerate(uniqueInds)
+        d = Normal(LC[LCi],err[LCi]/sqrt(uniqueCounts[LCi]))
+        MCLC[MCLCi] = rand(d)
+    end
+    perm = sortperm(tMC) #put the points back in ascending order in t
+    return MCLC[perm], tMC[perm]
+end
+
+function getDataLC(lineData,Δλ; λRange=[1520,1646],tStop = nothing, contRange = nothing, model=true)
+    # THIS ISNT WORKING RIGHT -- need to remove continuum? see note below, maybe just re-write integration routine seems too complex as is
+    #TO DO: "de-trend" and remove continuum level from line (use points at either side of λRange?)
+    tLC = [lineData[i].t for i in 1:length(lineData)]
+    tLC = tLC.-tLC[1] #normalize to first visit
+    if tStop != nothing
+        stopInd = findfirst(tLC.>=tStop)
+        lineData = lineData[1:stopInd]
+        tLC = tLC[1:stopInd]
+    end
+    if contRange == nothing
+        contRange = [(λRange[1]-10,λRange[1]), (λRange[2],λRange[2]+10)]
+    end
+
+    function integrateSpectrum(spectrum,λRange,contRange,model)
+        f = spectrum.flux; λ = spectrum.λ; error = spectrum.error
+        if model
+            f = spectrum.model_flux
+        end
+        λ1,λ2 = mean.(contRange)
+        f1,f2 = mean(f[(λ.>contRange[1][1]) .& (λ.<contRange[1][2])]),mean(f[(λ.>contRange[2][1]) .& (λ.<contRange[2][2])])
+        m = (f2-f1)/(λ2-λ1); b = f1 - m*λ1
+        C(λ,m,b) = m*λ + b
+        int = 0.0; cumErr = 0.0
+        integrand(λ1,λ2,f1,f2,m,b) = (λ2-λ1)*((f1-C(λ1,m,b))+(f2-C(λ2,m,b)))/2 #trapezoidal rule
+        mask = (λ.>λRange[1]) .& (λ.<=λRange[2])
+        λ = λ[mask]; f = f[mask]
+        for λi in 2:length(λ)
+            int += integrand(λ[λi-1],λ[λi],f[λi-1],f[λi],m,b)
+            cumErr += ((error[λi]+error[λi-1])*(λ[λi]-λ[λi-1])/2)^2
+        end
+        return int, sqrt(cumErr)
+    end
+
+    nBins = Int(ceil((λRange[2]-λRange[1])/Δλ))
+    λBinEdges = range(λRange[1],λRange[2],length=nBins+1) 
+    LC = zeros(length(tLC),nBins); LCerror = zeros(length(tLC),nBins)
+
+    for (ti,spectrum) in enumerate(lineData)
+        for λi in 1:length(λBinEdges)-1
+            λRange = (λBinEdges[λi],λBinEdges[λi+1])
+            int, err = integrateSpectrum(spectrum,λRange,contRange,model)
+            LC[ti,λi] = int; LCerror[ti,λi] = err
+        end
+    end
+    return LC,LCerror,λBinEdges,tLC
+end
+
+#scratch space
+function readFigureData(csv)
+    data = readdlm(csv,',') #shape [nPoints,5] -- [v,delay,pointNumber,identifier (i.e. Std),second identifier (i.e. +/- 1)]
+    v = zeros(Int(size(data)[1]/3)); delay = zeros(Int(size(data)[1]/3)); errUp = zeros(Int(size(data)[1]/3)); errDown = zeros(Int(size(data)[1]/3))
+    for i=1:length(v)
+        v[i] = mean(data[3*i-2:3*i,1])
+        delay[i] = data[3*i-1,2]
+        errDown[i] = data[3*i-2,2] - delay[i] #note that then errDown < 0, errUp > 0
+        errUp[i] = data[3*i,2] - delay[i] #when plotting then need to take abs(errDown) for yerr/ribbon args 
+    end
+    return v,delay,errUp,errDown
+end
+
+function getLineDelays(lineData,CLC;Δλ=10.,λRange=[1450,1730],model=true,centroid=true,MCMC=1,kwargs...)
+    tC = CLC.t; u = CLC.flux;
+    LC,LCerr,λBins,tLC = getDataLC(lineData,Δλ,tC,λRange=λRange,model=model)
+    lineDelays = zeros(size(LC,2),MCMC)#one delay for each bin
+    for MCi in 1:MCMC
+        percentFloor = floor(Int,MCi/MCMC*100)
+        progressBar = percentFloor > 0 ? "["*"="^(percentFloor-1)*">"*" "^(99-(percentFloor-1))*"]" : "["*">"*" "^(99)*"]"
+        print("MC estimation progress: "*progressBar*"\r")
+        for i in 1:size(LC,2)
+            v = LC[:,i]
+            MCLCi,tLCi = MCLC(v,LCerr[:,i],tLC)
+            CCF, lags = getCCF(u,MCLCi,tC,tLCi; kwargs...)
+            lineDelays[i,MCi] = centroid ? getCCFCentroid(CCF,lags) : getCCFPeak(CCF,lags)
+        end
+    end
+    println()
+    binCenters = λBins[1:end-1] .+ Δλ/2
+    lineDelays = mean(lineDelays,dims=2)
+    return lineDelays, binCenters
+end
+
+function plotCCF(u,v,t; tRange=nothing,normalize=true,lags=nothing,spline=false,superSample=100)
+    CCF, t = getCCF(u,v,t,tRange=tRange,normalize=normalize,lags=lags,spline=spline,superSample=superSample)
     p = plot()
     if length(CCF) == 1
         p = plot!(t,CCF,legend=false,xlabel="offset τ [days]",ylabel="r",ylims=(-0.1,1),widen=false,size=(720,720),minorticks=true,
@@ -292,84 +474,4 @@ function LC_CCF_stacked(LCData; continuum="F1367",emission="F_Lya",tRange=nothin
     p2 = plotCCF(LCData,continuum=continuum,emission=emission,tRange=tRange,normalize=normalize,lags=lags,spline=spline,model=model)
     p = plot(p1,p2,layout=@layout([a;b]),size=(720,1440),left_margin=10*Plots.Measures.mm)
     return p
-end
-
-function getLineModelStrings(line::String; sample_fits::String="/home/kirk/Documents/research/Dexter/STORM/HST/models/hlsp_storm_hst_cos_ngc-5548-go13330-v0a_g130m-g160m_v1_model.fits") #don't think this is quite right at end product, do further testing tmoorrow
-    f = FITS(sample_fits)
-    header_string = read_header(f[1],String)
-    split_strip_header = strip.(split(header_string,"HISTORY"))
-    GaussianModelStrings = split_strip_header[startswith.(split_strip_header,"Gaussian")]
-    lineMask = occursin.(line,GaussianModelStrings)
-    lineStrings = GaussianModelStrings[lineMask]
-    BLRMask = occursin.("Broad",lineStrings)
-    BLAMask = occursin.("Broad Absorption",lineStrings)
-    BLREmissionMask = (BLRMask) .& (.!BLAMask)
-    bumpMask = occursin.("Bump",lineStrings)
-    finalMask = (BLREmissionMask) .|| (bumpMask)
-    lineStrings = lineStrings[finalMask]
-    components = [strip(split(lineStrings[i]," ")[3],':') for i in eachindex(lineStrings)]
-    return tryparse.(Int,components)
-end
-    #remove "broad absorption" lines from getLineModelStrings
-
-    
-function getSpectra(sortedFiles; src_dir=pwd(),model="all")
-    data = Array{spectrum,1}(undef, length(sortedFiles))
-    for (i,file) in enumerate(sortedFiles)
-        filename = string(src_dir,file)
-        f = FITS(filename)
-        λ = read(f[2], "WAVE") #angstroms
-        flux = read(f[2], "FLUX") #cW / m^2 / A
-        error = read(f[2], "e_FLUX")#"          "
-        cont_flux = read(f[2], "FCONT") #"      "
-        model_flux = nothing
-        if model == "all"
-            model_flux = read(f[2], "MODFLUX")
-        else
-            if typeof(model) == Array{Int64,1}
-                model_flux = read(f[2],"GAUSS$(model[1])")
-                for j in model[2:end]
-                    model_flux .+= read(f[2],"GAUSS$j")
-                end
-            elseif typeof(model) == Int64 || typeof(model) == Int32
-                model_flux = read(f[2],"GAUSS$model")
-            else
-                error("model must be an integer or array of integers")
-            end
-        end
-        exp,t = getSpectrumTimeInfo(filename)
-        data[i] = spectrum(filename, λ, flux, error, cont_flux, model_flux, t, exp)
-    end
-    return data
-end
-
-struct avgSpectrum
-    λ::Array{Float64,1}
-    flux::Array{Float64,1}
-    error::Array{Float64,1}
-    model_flux::Array{Float64,1}
-end
-
-function getAvgSpectrum(spectra; λRange=nothing)
-    avg_λ = sort(unique(vcat([spectra[i].λ for i in 1:length(spectra)]...)))
-    if λRange != nothing
-        mask = (avg_λ .> λRange[1]) .& (avg_λ .< λRange[2])
-        avg_λ = avg_λ[mask]
-    end
-    avg_flux = zeros(length(avg_λ))
-    avg_error = zeros(length(avg_λ))
-    avg_model_flux = zeros(length(avg_λ))
-    n = zeros(length(avg_λ))
-    for (i,λ) in enumerate(avg_λ)
-        for spectrum in spectra
-            if λ in spectrum.λ
-                ind = findfirst(spectrum.λ .== λ)
-                avg_flux[i] += spectrum.flux[ind]
-                avg_error[i] += spectrum.error[ind]^2
-                avg_model_flux[i] += spectrum.model_flux[ind]
-                n[i] += 1
-            end
-        end
-    end
-    return avgSpectrum(avg_λ,avg_flux./n,sqrt.(avg_error)./n,avg_model_flux./n)
 end

@@ -1,13 +1,14 @@
 #!/usr/bin/env julia
-using PyCall, Interpolations, Test, Statistics, StatsBase, Plots, Printf, BinnedStatistics
+using Interpolations, Test, Statistics, StatsBase, Plots, Printf, BinnedStatistics
 
 #include("pyimports.jl")
 using .pyimports: G1D, pickle#, readPickle
 
 #new script for building up more general Julia code
 
-function get_rMinMax(r̄::Float64,rFac::Float64,α::Float64)
-    rMin = r̄*(2*α-1)/(1+2*α)*(rFac^(-1/2-α)-1)/(rFac^(1/2-α)-1)
+function get_rMinMax(r̄::Float64,rFac::Float64,α::Float64) #update -- including extra factor of r from dA (I is integrated quantity)
+    #rMin = r̄*(2*α-1)/(1+2*α)*(rFac^(-1/2-α)-1)/(rFac^(1/2-α)-1) -- old way (no dA)
+    rMin = r̄*(3-2*α)/(1-2*α)*(rFac^(1/2-α)-1)/(rFac^(3/2-α)-1)
     rMax = rMin*rFac
     return rMin,rMax
 end
@@ -149,36 +150,38 @@ function phase(ν::Array{Float64,2},I::Array{Float64,2},dA::Array{Float64,2},x::
 end
 
 function getProfiles(params,data;
-    bins::Int=200,nr::Int=1024,nϕ::Int=2048,coordsType::Symbol=:polar,scale_type::Symbol=:log,
+    bins::Int=200,nr::Int=1024,nϕ::Int=2048,coordsType::Symbol=:polar,scale_type::Symbol=:log,dtype::String="",
     νMin::Float64=0.98, νMax::Float64=1.02, centered::Bool=true, return_phase::Bool=true, return_LP::Bool=true, 
-    return_LC::Bool=false,τ::Float64 = 10.) #corresponds to +/- 6 km/s by default
+    return_LC::Bool=false,return_VDelay::Bool=false,τ::Float64 = 10.,λCen=2.172) #corresponds to +/- 6 km/s by default
     #this is ~3x as fast as python version!
-    i,r̄,Mfac,rFac,f1,f2,f3,pa,scale,cenShift,Sα = nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing
-    if length(data) == 8 #RM case
-        i,r̄,Mfac,rFac,f1,f2,f3,scale,cenShift,Sα = params
+    i,r̄,Mfac,rFac,f1,f2,f3,f4,pa,scale,cenShift,Sα = nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing
+    if dtype == "RM" #RM case
+        i,r̄,Mfac,rFac,f1,f2,f3,f4,scale,cenShift,Sα = params
     else
-        i,r̄,Mfac,rFac,f1,f2,f3,pa,scale,cenShift,Sα = params
+        i,r̄,Mfac,rFac,f1,f2,f3,f4,pa,scale,cenShift,Sα = params
     end
-    f4 = 1.0 - (f1+f2+f3) #normalize so f1+f2+f3+f4 = 1
+    s = sum(f1+f2+f3+f4)
+    f1 = f1/s; f2 = f2/s; f3 = f3/s; f4 = f4/s #normalize to 1
 
-    λCen = 2.172 + cenShift #microns, to compare with data
+    λCen = λCen + cenShift #microns, to compare with data
     #ν = (data[1].-2.172)./λCen #code units, cenShift should be small this is just for calculating min and max
     BLRAng = Mfac*3e8*2e33*6.67e-8/9e20/548/3.09e24 #solar masses * G / c^2 / Mpc -> end units = rad
     α,β,r,ν,ϕ,sini,cosi,dA,rMin,rMax = setup(i,nr,nϕ,r̄,rFac,Sα,coordsType,scale_type)
     t = nothing
     rs = 2*Mfac*3e8*2e30*6.67e-11/9e16
-    if return_LC
+    if return_LC || return_VDelay
         days = 24*3600.
         t = r .* (rs/3e8/days) .* (1 .+ sin.(ϕ).*sini)
     end
     
     I = getIntensity(r,ϕ,sini,cosi,rMin,rMax,Sα,τ,f1=f1,f2=f2,f3=f3,f4=f4)
-    interpLine = nothing; interpPhaseList = nothing; synthLC = nothing
+    LP = nothing; interpPhaseList = nothing; synthLC = nothing
     λData = nothing; tData = nothing; UData = nothing; VData = nothing
     LPNorm = nothing; LCNorm = nothing; Ct = nothing; CLC = nothing
+    delays = nothing; delay_data = nothing
 
-    if length(data) == 8 #RM Data
-        line_t,lineLC,LCerror,cont_t,contLC,λData,model_flux,LPerror = data
+    if dtype == "RM" #RM Data
+        line_t,lineLC,LCerror,cont_t,contLC,λData,model_flux,LPerror,delay_data = data
         CLC = contLC; Ct = cont_t
         tData = line_t
         LPNorm = maximum(model_flux)
@@ -191,48 +194,68 @@ function getProfiles(params,data;
         LPNorm = maximum(data[4])
     end
 
-    if return_LP || return_phase
+    if return_LP || return_phase || return_VDelay
         νEdges,νCenters,flux = histSum(ν,I.*dA,bins=bins,νMin=νMin,νMax=νMax,centered=centered)
-        λ = λCen ./ νCenters #ν is really ν/ν_c -> ν/ν_c = (c/λ)/(c/λ_c) = λ_c/λ -> λ = λ_c / (ν/ν_c) = λ / code ν
-        fline = flux./maximum(flux)*LPNorm*scale
-        psf=4e-3/2.35
-        lineAvg = G1D[](fline,psf/3e5/(νCenters[2]-νCenters[1]))
-        lineAvg = fline
-
-        x = reverse(λ) #need to go from low to high for interpolation
-        interpLine = LinearInterpolation(x,reverse(lineAvg),extrapolation_bc=Line())
-
-        if return_phase
-            X = α.*BLRAng; Y = β.*BLRAng
-            dϕList = []
-            for i=1:length(UData)
-                for ii in [I]
-                    dϕAvgRaw = phase(ν,ii,dA,X,Y,r,UData[i],VData[i],pa,νMin,νMax,bins)
-                    dϕAvg = G1D[](dϕAvgRaw,psf/3e5/(νCenters[2]-νCenters[1]))
-                    push!(dϕList,dϕAvg)
-                end
+        if return_VDelay
+            delays = zeros(length(νCenters))
+            for i=1:length(νEdges)-1
+                ν1 = νEdges[i]; ν2 = νEdges[i+1]
+                mask = (ν .> ν1) .& (ν .<= ν2)
+                tEdges,tCenters,Ψτ = histSum(t[mask],I[mask].*dA[mask],bins=bins,νMin=0.0,νMax=tData != nothing ? maximum(tData) : sum(t.*I.*dA)/sum(I.*dA)*10,centered=centered) #transfer function at velocity bin
+                delays[i] = sum(tCenters.*Ψτ)/sum(Ψτ) #weighted delay by transfer function
+                #delays[i] = sum(I[mask].*r[mask].*dA[mask])/sum(I[mask].*dA[mask])*rs/3e8/days #weighted mean radius by intensity -> light travel time [days]
             end
-            indx=[0,1,2,6,7,8,12,13,14,18,19,20].+1; oindx=[3,4,5,9,10,11,15,16,17,21,22,23].+1
-            interpPhaseList = []; 
-            for i=1:length(dϕList)
-                yP = dϕList[i].*reverse(lineAvg)./(1 .+ reverse(lineAvg)) #so it matches x, rescale by f/(1+f)
-                interpPhase = LinearInterpolation(x,yP,extrapolation_bc=Line())
-                push!(interpPhaseList,interpPhase.(λData))
+            vCenters = (νCenters.-1).*3e5 #km/s, to match data from figure
+            if dtype == "RM"
+                delayV,delayMeasurement,delayErrUp,delaryErrDown = delay_data
+                interpDelay = LinearInterpolation(vCenters,delays,extrapolation_bc=Line())
+                delays = interpDelay.(delayV)
+            end
+            delays = (vCenters,delays)
+        end
+        if return_LP || return_phase
+            λ = λCen ./ νCenters #ν is really ν/ν_c -> ν/ν_c = (c/λ)/(c/λ_c) = λ_c/λ -> λ = λ_c / (ν/ν_c) = λ / code ν
+            fline = flux./maximum(flux)*LPNorm*scale
+            psf=4e-3/2.35
+            lineAvg = G1D[](fline,psf/3e5/(νCenters[2]-νCenters[1]))
+            lineAvg = fline
+
+            x = reverse(λ) #need to go from low to high for interpolation
+            interpLine = LinearInterpolation(x,reverse(lineAvg),extrapolation_bc=Line())
+            LP = interpLine.(λData)
+
+            if return_phase
+                X = α.*BLRAng; Y = β.*BLRAng
+                dϕList = []
+                for i=1:length(UData)
+                    for ii in [I]
+                        dϕAvgRaw = phase(ν,ii,dA,X,Y,r,UData[i],VData[i],pa,νMin,νMax,bins)
+                        dϕAvg = G1D[](dϕAvgRaw,psf/3e5/(νCenters[2]-νCenters[1]))
+                        push!(dϕList,dϕAvg)
+                    end
+                end
+                indx=[0,1,2,6,7,8,12,13,14,18,19,20].+1; oindx=[3,4,5,9,10,11,15,16,17,21,22,23].+1
+                interpPhaseList = []; 
+                for i=1:length(dϕList)
+                    yP = dϕList[i].*reverse(lineAvg)./(1 .+ reverse(lineAvg)) #so it matches x, rescale by f/(1+f)
+                    interpPhase = LinearInterpolation(x,yP,extrapolation_bc=Line())
+                    push!(interpPhaseList,interpPhase.(λData))
+                end
             end
         end
     end
 
-    if return_LC
+    if return_LC 
         tEdges,tCenters,Ψτ = histSum(t,I.*dA,bins=bins,νMin=0.0,νMax=maximum(tData),centered=centered)
         Ψτ = Ψτ./maximum(Ψτ)
         Ψτ = G1D[](Ψτ,1/(tCenters[2]-tCenters[1]))
         interp_τ = LinearInterpolation(tCenters,Ψτ,extrapolation_bc=Line())
         synthLC = syntheticLC(Ct,CLC,interp_τ.(tData))[1].*LCNorm.+lineLC[1] #defaults tStop = 75, spline = false, continuum = "1367"
     end
-    
+
     retList = []
     if return_LP
-        push!(retList,interpLine.(λData))
+        push!(retList,LP)
     end
     if return_phase
         push!(retList,interpPhaseList)
@@ -240,5 +263,60 @@ function getProfiles(params,data;
     if return_LC
         push!(retList,synthLC)
     end
+    if return_VDelay
+        push!(retList,delays)
+    end
     return λData, retList
+end
+
+function getModelProfiles(θ;bins=200,centered=true,type="RM",tMax=100,nr=512,nphi=1024,coordsType=:polar,scale_type=:log)
+    nϕ = nphi
+    i,r̄,Mfac,rFac,f1,f2,f3,f4,pa,scale,cenShift,Sα = nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing
+    if type == "RM" #RM case
+        i,r̄,Mfac,rFac,f1,f2,f3,f4,scale,cenShift,Sα = θ
+    else
+        i,r̄,Mfac,rFac,f1,f2,f3,f4,pa,scale,cenShift,Sα = θ
+    end
+    s = sum(f1+f2+f3+f4)
+    f1 = f1/s; f2 = f2/s; f3 = f3/s; f4 = f4/s #normalize to 1
+    λCen = 1572.; τ = 10.
+    λCen = λCen# + cenShift #microns, to compare with data, this is done later below
+    #ν = (data[1].-2.172)./λCen #code units, cenShift should be small this is just for calculating min and max
+    BLRAng = Mfac*3e8*2e33*6.67e-8/9e20/548/3.09e24 #solar masses * G / c^2 / Mpc -> end units = rad
+    α,β,r,ν,ϕ,sini,cosi,dA,rMin,rMax = DiskWind.setup(i,nr,nϕ,r̄,rFac,Sα,coordsType,scale_type)
+    t = nothing; delays = nothing; dϕphiList = nothing
+    rs = 2*Mfac*3e8*2e30*6.67e-11/9e16
+    if type == "RM"
+        days = 24*3600.
+        t = r .* (rs/3e8/days) .* (1 .+ sin.(ϕ).*sini)
+    end
+
+    I = DiskWind.getIntensity(r,ϕ,sini,cosi,rMin,rMax,Sα,τ,f1=f1,f2=f2,f3=f3,f4=f4)
+    νEdges,νCenters,flux = binnedStatistic(ν,I.*dA,nbins=bins,centered=centered)
+    vShift = cenShift/λCen*3e5
+    vCenters = (νCenters.-1).*3e5 #km/s, to match data from figure
+    vCenters = vCenters .+ vShift
+    fline = flux./maximum(flux).*scale
+    
+    if type == "RM"
+        delays = zeros(length(νCenters))
+        for i=1:length(νEdges)-1
+            ν1 = νEdges[i]; ν2 = νEdges[i+1]
+            mask = (ν .> ν1) .& (ν .<= ν2) .& (t .< tMax)
+            tEdges,tCenters,Ψτ = binnedStatistic(t[mask],I[mask].*dA[mask],nbins=bins,centered=centered) #transfer function at velocity bin
+            delays[i] = sum(tCenters.*Ψτ)/sum(Ψτ)
+        end
+        return vCenters, fline, delays
+    else
+        X = α.*BLRAng; Y = β.*BLRAng
+        dϕList = []
+        for i=1:length(UData)
+            for ii in [I]
+                dϕAvgRaw = DiskWind.phase(ν,ii,dA,X,Y,r,UData[i],VData[i],pa,0.95,1.05,bins)
+                dϕAvg = G1D[](dϕAvgRaw,psf/3e5/(νCenters[2]-νCenters[1]))
+                push!(dϕList.*(reverse(fline)./(1 .+ reverse(fline))),dϕAvg)
+            end
+        end
+        return vCenters, fline, dϕList
+    end
 end
